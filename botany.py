@@ -10,6 +10,7 @@ import threading
 import errno
 import uuid
 import sqlite3
+import argparse
 from menu_screen import *
 
 # TODO:
@@ -629,6 +630,10 @@ class DataManager(object):
         return new_file_check
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-color", action="store_true")
+    args = parser.parse_args()
+
     my_data = DataManager()
     # if plant save file exists
     if my_data.check_plant():
@@ -641,7 +646,8 @@ if __name__ == '__main__':
     my_plant.start_life()
     my_data.start_threads(my_plant)
     try:
-        botany_menu = CursedMenu(my_plant,my_data)
+        enable_color = not args.no_color
+        botany_menu = CursedMenu(my_plant,my_data,enable_color)
         my_data.save_plant(my_plant)
         my_data.data_write_json(my_plant)
         my_data.update_garden_db(my_plant)

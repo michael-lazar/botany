@@ -12,18 +12,203 @@ import string
 import re
 import completer
 import datetime
+import collections
+import itertools
+
+
+Tile = collections.namedtuple("Tile", ["char", "bg", "fg"])
+
+
+class ArtFile:
+    """
+    Class that manages loading and rendering ASCII art files to the screen.
+    """
+
+    ART_DIR = os.path.join(os.path.dirname(__file__), "art")
+    CHARSET = "dos"
+    PALETTE = "ansi-240"
+
+    # Common color codes used across all of the source playscii files
+    DEFAULT_BG = 1
+    DEFAULT_FG = 0
+    DEFAULT_SOIL = 80
+    DEFAULT_COLOR_PRIMARY = 133
+    DEFAULT_COLOR_SECONDARY = 199
+
+    # Default character to use for empty spaces
+    FILL_CHAR = " "
+
+    # Palette mapping for scene colors
+    BACKGROUND_COLOR = curses.COLOR_BLACK
+    FOREGROUND_COLOR = None
+    SOIL_COLOR = 95
+
+    # Palette mapping for flower colors: (primary, secondary)
+    FLOWER_COLORS = {
+        "red": (197, 204),
+        "orange": (202, 214),
+        "yellow": (226, 222),
+        "green": (85, 119),
+        "blue": (81, 33),
+        "indigo": (63, 98),
+        "violet": (165, 199),
+        "white": (250, 254),
+        "black": (239, 243),
+        "gold": (178, 180),
+    }
+
+    # Special palette for rainbow colored flowers
+    RAINBOW_COLORS = [20, 160, 226, 208, 45, 213, 46]
+
+    COLOR_PAIRS = {}
+
+    def __init__(self, filename, flower_color=None):
+        self.filename = filename
+        self.flower_color = flower_color
+        self.character_matrix = self.load_file(filename)
+        self.rainbow_generator = itertools.cycle(self.RAINBOW_COLORS)
+
+    @classmethod
+    def init_pair(cls, fg, bg):
+        """
+        Register a color pair with curses and cache the index in a global dictionary.
+        """
+        fg = fg if fg is not None else -1
+        bg = bg if bg is not None else -1
+        if (fg, bg) not in cls.COLOR_PAIRS:
+            color_number = len(cls.COLOR_PAIRS) + 1
+            curses.init_pair(color_number, fg, bg)
+            cls.COLOR_PAIRS[(fg, bg)] = curses.color_pair(color_number)
+        return cls.COLOR_PAIRS[(fg, bg)]
+
+    @classmethod
+    def load_file(cls, filename):
+        """
+        Load a playscii file and build a matrix of characters representing the scene.
+        """
+        with open(os.path.join(cls.ART_DIR, filename)) as fp:
+            playscii_data = json.load(fp)
+
+        if playscii_data["palette"] != cls.PALETTE:
+            raise ValueError(
+                "Encountered unexpected palette {}".format(playscii_data['palette'])
+            )
+        if playscii_data["charset"] != cls.CHARSET:
+            raise ValueError(
+                "Encountered unexpected charset {}".format(playscii_data['charset'])
+            )
+
+        tiles = iter(playscii_data["frames"][0]["layers"][0]["tiles"])
+        data = []
+        for _ in range(playscii_data["height"]):
+            line = []
+            for _ in range(playscii_data["width"]):
+                tile = next(tiles)
+                char = chr(tile["char"]) if tile["char"] != 0 else cls.FILL_CHAR
+                bg = tile["bg"] + 15 if tile["bg"] != cls.DEFAULT_BG else None
+                fg = tile["fg"] + 15 if tile["fg"] != cls.DEFAULT_FG else None
+                if char == cls.FILL_CHAR:
+                    # Ignore the foreground color if we don't have any foreground character
+                    fg = None
+                line.append(Tile(char, bg, fg))
+            data.append(line)
+        return data
+
+    def export(self):
+        """
+        Return an art file as plain-text ASCII.
+        """
+        lines = []
+        for character_row in self.character_matrix:
+            lines.append("".join([tile.char for tile in character_row]))
+        return "\n".join(lines)
+
+    def draw(self, window, x, y, enable_color=False):
+        """
+        Render the art to the curses window at the given location.
+        """
+        if enable_color and curses.has_colors() and curses.COLOR_PAIRS >= 256:
+            return self._draw_color(window, x, y)
+        else:
+            return self._draw_normal(window, x, y)
+
+    def _draw_normal(self, window, x, y):
+        for y_offset, character_row in enumerate(self.character_matrix):
+            text = "".join([tile.char for tile in character_row])
+            window.addstr(y + y_offset, x, text)
+
+    def _draw_color(self, window, x, y):
+        for y_offset, character_row in enumerate(self.merge_tiles(self.character_matrix)):
+            window.move(y + y_offset, x)
+            for tile in character_row:
+                bg = self.substitute_background_color(tile.bg)
+                fg = self.substitute_foreground_color(tile.fg)
+                color_attr = self.init_pair(fg, bg)
+                window.addstr(tile.char, color_attr)
+
+    def substitute_background_color(self, code):
+        return code if code is not None else self.BACKGROUND_COLOR
+
+    def substitute_foreground_color(self, code):
+        if code is None:
+            return self.FOREGROUND_COLOR
+        elif code == self.DEFAULT_SOIL:
+            return self.SOIL_COLOR
+        elif code == self.DEFAULT_COLOR_PRIMARY:
+            if self.flower_color == "rainbow":
+                return next(self.rainbow_generator)
+            elif self.flower_color:
+                return self.FLOWER_COLORS[self.flower_color][0]
+            else:
+                return code
+        elif code == self.DEFAULT_COLOR_SECONDARY:
+            if self.flower_color == "rainbow":
+                return next(self.rainbow_generator)
+            elif self.flower_color:
+                return self.FLOWER_COLORS[self.flower_color][1]
+            else:
+                return code
+        else:
+            return code
+
+    @classmethod
+    def merge_tiles(cls, character_matrix):
+        """
+        Merge repeated tiles with the same styling into larger, single tiles.
+
+        This minimizes the total number of ANSI escape sequences needed to
+        render the final output.
+        """
+        new_matrix = []
+        for character_row in character_matrix:
+            line = character_row[:1]
+            for tile in character_row[1:]:
+                last_tile = line[-1]
+                if tile.fg in (cls.DEFAULT_COLOR_PRIMARY, cls.DEFAULT_COLOR_SECONDARY):
+                    # Never merge flowers, it screws up the rainbow color generation
+                    line.append(tile)
+                elif (tile.fg, tile.bg) == (last_tile.fg, last_tile.bg):
+                    new_char = last_tile.char + tile.char
+                    line[-1] = Tile(new_char, tile.bg, tile.fg)
+                else:
+                    line.append(tile)
+            new_matrix.append(line)
+        return new_matrix
+
 
 class CursedMenu(object):
     #TODO: name your plant
     '''A class which abstracts the horrors of building a curses-based menu system'''
-    def __init__(self, this_plant, this_data):
+    def __init__(self, this_plant, this_data, enable_color=True):
         '''Initialization'''
         self.initialized = False
         self.screen = curses.initscr()
+        self.enable_color = enable_color
         curses.noecho()
         curses.raw()
-        if curses.has_colors():
+        if self.enable_color and curses.has_colors():
             curses.start_color()
+            curses.use_default_colors()
         try:
             curses.curs_set(0)
         except curses.error:
@@ -59,15 +244,15 @@ class CursedMenu(object):
     def define_colors(self):
         # TODO: implement colors
         # set curses color pairs manually
-        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
-        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(4, curses.COLOR_BLUE, curses.COLOR_BLACK)
-        curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
-        curses.init_pair(6, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(7, curses.COLOR_RED, curses.COLOR_BLACK)
-        curses.init_pair(8, curses.COLOR_CYAN, curses.COLOR_BLACK)
-
+        ArtFile.init_pair(curses.COLOR_BLACK, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_WHITE, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_GREEN, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_BLUE, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_MAGENTA, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_YELLOW, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_RED, curses.COLOR_WHITE)
+        ArtFile.init_pair(curses.COLOR_CYAN, curses.COLOR_WHITE)
+        
     def show(self, options, title, subtitle):
         # Draws a menu with parameters
         self.set_options(options)
@@ -133,21 +318,12 @@ class CursedMenu(object):
             self.__exit__()
 
     def ascii_render(self, filename, ypos, xpos):
-        # Prints ASCII art from file at given coordinates
-        this_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),"art")
-        this_filename = os.path.join(this_dir,filename)
-        this_file = open(this_filename,"r")
-        this_string = this_file.readlines()
-        this_file.close()
         self.screen_lock.acquire()
-        for y, line in enumerate(this_string, 2):
-            self.screen.addstr(ypos+y, xpos, line, curses.A_NORMAL)
-        # self.screen.refresh()
+        ArtFile(filename, self.plant.color).draw(self.screen, xpos, ypos, self.enable_color)
         self.screen_lock.release()
 
-    def draw_plant_ascii(self, this_plant):
-        ypos = 0
-        xpos = int((self.maxx-37)/2 + 25)
+    @staticmethod
+    def get_art_file(this_plant):
         plant_art_list = [
             'poppy',
             'cactus',
@@ -173,22 +349,25 @@ class CursedMenu(object):
             'pachypodium',
         ]
         if this_plant.dead == True:
-            self.ascii_render('rip.txt', ypos, xpos)
+            return 'rip.psci'
         elif datetime.date.today().month == 10 and datetime.date.today().day == 31:
-            self.ascii_render('jackolantern.txt', ypos, xpos)
+            return 'jackolantern.psci'
         elif this_plant.stage == 0:
-            self.ascii_render('seed.txt', ypos, xpos)
+            return 'seed.psci'
         elif this_plant.stage == 1:
-            self.ascii_render('seedling.txt', ypos, xpos)
+            return 'seedling.psci'
         elif this_plant.stage == 2:
-            this_filename = plant_art_list[this_plant.species]+'1.txt'
-            self.ascii_render(this_filename, ypos, xpos)
+            return plant_art_list[this_plant.species] + '1.psci'
         elif this_plant.stage == 3 or this_plant.stage == 5:
-            this_filename = plant_art_list[this_plant.species]+'2.txt'
-            self.ascii_render(this_filename, ypos, xpos)
+            return plant_art_list[this_plant.species] + '2.psci'
         elif this_plant.stage == 4:
-            this_filename = plant_art_list[this_plant.species]+'3.txt'
-            self.ascii_render(this_filename, ypos, xpos)
+            return plant_art_list[this_plant.species] + '3.psci'
+
+    def draw_plant_ascii(self, this_plant):
+        ypos = 0
+        xpos = int((self.maxx-37)/2 + 25)
+        filename = self.get_art_file(this_plant)
+        self.ascii_render(filename, ypos, xpos)
 
     def draw_default(self):
         # draws default menu
